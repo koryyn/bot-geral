@@ -1,22 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BOT-GERAL — Automação de Pesquisa e Inscrição de Voluntários
-================================================================
-Executa em dois momentos:
+BOT-GERAL - Automacao SIMPLES de Pesquisa e Inscricao de Voluntarios SEAPE
+==========================================================================
+Plano B do sisvep-bot: sem perguntas no Telegram. Pega TODAS as vagas
+disponiveis e tenta se inscrever em todas.
 
-1. 19:58 BRT → Pesquisa todos os voluntários vagos disponíveis
-2. 19:59:50-20:00:40 BRT → Inscreve automaticamente em TODAS as vagas encontradas
+Modos (variavel de ambiente MODO):
+  pesquisa  -> loga, pesquisa todas as vagas e avisa no Telegram
+  inscricao -> loga, pesquisa todas as vagas e tenta inscrever em todas
 
-Secrets necessários no GitHub:
-  SISVEP_MATRICULA  — sua matrícula
-  SISVEP_SENHA      — sua senha
-  TG_TOKEN          — token do bot Telegram (opcional, para notificações)
-  TG_CHAT_ID        — seu chat ID no Telegram (opcional)
+Baseado no formulario REAL do SISVEP (pesquisa.xhtml / inscricao.xhtml),
+inspecionado em sessao autenticada em 12/06/2026. Os campos sao localizados
+DINAMICAMENTE (pelos rotulos/opcoes), para nao quebrar quando o PrimeFaces
+muda os IDs auto-gerados.
+
+Secrets no GitHub:
+  SISVEP_MATRICULA, SISVEP_SENHA  (obrigatorios)
+  TG_TOKEN, TG_CHAT_ID            (opcionais - notificacoes)
+  MODO                            (pesquisa | inscricao)
+
+NOTA: a confirmacao da inscricao exige re-autenticacao (usuario+senha). O
+passo de inscricao e best-effort e so reporta SUCESSO com confirmacao
+explicita do site (nunca por simples HTTP 200).
 """
 
 import os
-import re
 import sys
 import time
 import logging
@@ -24,330 +33,334 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIGURAÇÕES
-# ─────────────────────────────────────────────────────────────────────────────
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("bot-geral")
 
 MATRICULA = os.environ.get("SISVEP_MATRICULA", "")
 SENHA = os.environ.get("SISVEP_SENHA", "")
 TG_TOKEN = os.environ.get("TG_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
-MODO = os.environ.get("MODO", "pesquisa")  # "pesquisa" ou "inscricao"
+MODO = os.environ.get("MODO", "pesquisa").strip().lower()
 
 BASE_URL = "https://voluntario.seape.df.gov.br"
-LOGIN_URL = f"{BASE_URL}/paginas/voluntario/login.xhtml"
+LOGIN_URL = f"{BASE_URL}/login.xhtml"                       # CORRIGIDO
 PESQUISA_URL = f"{BASE_URL}/paginas/voluntario/pesquisa.xhtml"
 INSCRICAO_URL = f"{BASE_URL}/paginas/voluntario/inscricao.xhtml"
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124.0.0.0 Safari/537.36"),
     "Accept-Language": "pt-BR,pt;q=0.9",
 }
 
-AJAX_HEADERS = {
-    **HEADERS,
-    "Faces-Request": "partial/ajax",
-    "X-Requested-With": "XMLHttpRequest",
-    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-}
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FUNÇÕES AUXILIARES
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Auxiliares
+# ---------------------------------------------------------------------------
 
-def hora():
-    return datetime.now().strftime("%H:%M:%S")
-
-def criar_sessao() -> requests.Session:
+def criar_sessao():
     s = requests.Session()
     s.headers.update(HEADERS)
     return s
 
-def enviar_telegram(mensagem: str):
-    """Envia mensagem ao Telegram (opcional)"""
+
+def enviar_telegram(mensagem):
     if not TG_TOKEN or not TG_CHAT_ID:
         return
     try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TG_CHAT_ID, "text": mensagem})
+        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                      json={"chat_id": TG_CHAT_ID, "text": mensagem}, timeout=10)
     except Exception as e:
-        log.warning(f"Não foi possível enviar ao Telegram: {e}")
+        log.warning(f"Telegram falhou: {e}")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LOGIN
-# ─────────────────────────────────────────────────────────────────────────────
 
-def get_viewstate(soup: BeautifulSoup) -> str:
-    """Extrai o ViewState da página"""
+def _viewstate(soup):
     el = soup.find("input", {"name": "javax.faces.ViewState"})
-    if not el:
-        raise RuntimeError("ViewState não encontrado na página")
-    return el["value"]
+    return el.get("value") if el else None
 
 
-def fazer_login(sessao: requests.Session) -> bool:
-    """
-    Faz login descobrindo os campos do formulário dinamicamente,
-    sem depender de IDs que podem mudar entre versões do JSF.
-    """
+# ---------------------------------------------------------------------------
+# Login (JSF: GET -> ViewState -> POST com campos reais)
+# ---------------------------------------------------------------------------
+
+def fazer_login(sessao):
     try:
-        log.info("Acessando página de login...")
+        log.info("Acessando login...")
         r = sessao.get(LOGIN_URL, timeout=20)
         r.raise_for_status()
-
         soup = BeautifulSoup(r.text, "html.parser")
-        vs = get_viewstate(soup)
-
-        # Descobre o formulário de login
-        form = soup.find("form")
-        if not form:
-            log.error("Formulário de login não encontrado")
+        vs = _viewstate(soup)
+        if not vs:
+            log.error("ViewState nao encontrado")
             return False
 
-        form_id = form.get("id", "")
+        form = soup.find("form")
+        if not form:
+            log.error("Form de login nao encontrado")
+            return False
+        form_id = form.get("id", "frm")
         action = form.get("action", LOGIN_URL)
         if not action.startswith("http"):
             action = BASE_URL + action
 
-        # Monta o payload base com todos os campos hidden
+        # base com todos os hidden
         payload = {}
         for inp in form.find_all("input"):
-            name = inp.get("name", "")
-            value = inp.get("value", "")
-            tipo = inp.get("type", "text").lower()
-            if name and tipo not in ("submit", "button", "image"):
-                payload[name] = value
+            nome = inp.get("name")
+            if nome and inp.get("type", "text").lower() not in ("submit", "button", "image"):
+                payload[nome] = inp.get("value", "")
 
-        # Sobrescreve ViewState
-        payload["javax.faces.ViewState"] = vs
+        # detecta campos de texto (matricula) e senha dinamicamente
+        textos = [i for i in form.find_all("input")
+                  if i.get("type", "text").lower() in ("text", "email", "") and i.get("name")]
+        senhas = [i for i in form.find_all("input")
+                  if i.get("type", "").lower() == "password" and i.get("name")]
+        if textos:
+            payload[textos[0]["name"]] = MATRICULA
+        if senhas:
+            payload[senhas[0]["name"]] = SENHA
 
-        # Preenche matrícula e senha detectando os campos pelo tipo e nome
-        campos_texto = [
-            i for i in form.find_all("input")
-            if i.get("type", "text").lower() in ("text", "email", "") and i.get("name")
-        ]
-        campos_senha = [
-            i for i in form.find_all("input")
-            if i.get("type", "").lower() == "password" and i.get("name")
-        ]
-
-        if campos_texto:
-            payload[campos_texto[0]["name"]] = MATRICULA
-            log.info(f"Campo matrícula: {campos_texto[0]['name']}")
-        else:
-            # Fallback para nomes comuns
-            for nome in ("username", "j_username", "cpf", "matricula"):
-                if nome in payload:
-                    payload[nome] = MATRICULA
-                    break
-
-        if campos_senha:
-            payload[campos_senha[0]["name"]] = SENHA
-            log.info(f"Campo senha: {campos_senha[0]['name']}")
-        else:
-            for nome in ("password", "j_password", "senha"):
-                if nome in payload:
-                    payload[nome] = SENHA
-                    break
-
-        # Adiciona o botão de submit se encontrado
+        # botao de submit
         btn = form.find("button", {"type": "submit"}) or form.find("input", {"type": "submit"})
         if btn and btn.get("name"):
-            payload[btn["name"]] = btn.get("value", "Entrar")
-
-        # Se formulário tem id, inclui no payload (padrão JSF)
+            payload[btn["name"]] = btn.get("value", "")
         if form_id:
             payload[form_id] = form_id
+        payload["javax.faces.ViewState"] = vs
 
-        log.info(f"Fazendo login com matrícula: {MATRICULA}")
         r2 = sessao.post(action, data=payload, timeout=20, allow_redirects=True)
-
-        # Verifica falha de login
-        if "login" in r2.url.lower():
-            soup2 = BeautifulSoup(r2.text, "html.parser")
-            erro = soup2.find(string=re.compile(r"inválid|incorret|erro|invalid", re.I))
-            if erro:
-                log.error(f"Falha no login: {erro.strip()}")
-                return False
-            if "login" in r2.url.lower() and "paginas" not in r2.url.lower():
-                log.warning("Redirecionou para login — credenciais podem estar erradas")
-                return False
-
-        log.info("✓ Login realizado com sucesso")
-        return True
-
+        txt = r2.text.lower()
+        ok = ("login.xhtml" not in r2.url.lower()) or ("sair" in txt) or ("logout" in txt)
+        if ok:
+            log.info("Login OK")
+        else:
+            log.error("Login falhou (continua na pagina de login)")
+        return ok
     except Exception as e:
         log.error(f"Erro no login: {e}")
         return False
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PESQUISA DE VAGAS
-# ─────────────────────────────────────────────────────────────────────────────
 
-def pesquisar_vagas(sessao: requests.Session) -> list:
+# ---------------------------------------------------------------------------
+# Pesquisa (form real frmPrincipal, campos localizados dinamicamente)
+# ---------------------------------------------------------------------------
+
+def _form_pesquisa(soup):
+    for b in soup.find_all(["button", "input"]):
+        if "pesquisar vagas" in (b.get_text() or b.get("value") or "").lower():
+            return b.find_parent("form")
+    return soup.find("form", {"id": "frmPrincipal"}) or soup.find("form")
+
+
+def _select_por_opcao(form, texto):
+    for sel in form.find_all("select"):
+        for opt in sel.find_all("option"):
+            if texto.lower() in opt.get_text().strip().lower():
+                return sel.get("name")
+    return None
+
+
+def _campo_data(form):
+    for inp in form.find_all("input"):
+        if (inp.get("id", "") or "").endswith("_input"):
+            return inp.get("name")
+    return None
+
+
+def _nome_botao(form):
+    for b in form.find_all(["button", "input"]):
+        if "pesquisar vagas" in (b.get_text() or b.get("value") or "").lower():
+            return b.get("name")
+    return None
+
+
+def _serializar_form(form):
+    dados = {}
+    for inp in form.find_all("input"):
+        nome = inp.get("name")
+        if not nome:
+            continue
+        tipo = (inp.get("type") or "text").lower()
+        if tipo in ("checkbox", "radio") and not inp.has_attr("checked"):
+            continue
+        dados[nome] = inp.get("value", "")
+    for sel in form.find_all("select"):
+        nome = sel.get("name")
+        if not nome:
+            continue
+        op = sel.find("option", selected=True) or sel.find("option")
+        dados[nome] = op.get("value", "") if op else ""
+    for ta in form.find_all("textarea"):
+        if ta.get("name"):
+            dados[ta.get("name")] = ta.get_text()
+    return dados
+
+
+def parse_vagas(html):
+    """Extrai vagas de tabelaVagasDisponiveis.
+    Colunas: Cod.Vaga | Qtd | Qtd Disponivel | Data/Hora | Jornada | Unidade | Selecionar
     """
-    Pesquisa todas as vagas disponíveis.
-    Retorna lista de dicionários com dados das vagas.
-    """
+    soup = BeautifulSoup(html, "html.parser")
+    tabela = soup.find(id=lambda x: x and "tabelaVagasDisponiveis" in x)
+    if not tabela:
+        return []
+    vagas = []
+    corpo = tabela.find("tbody") or tabela
+    for tr in corpo.find_all("tr"):
+        cels = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+        if len(cels) < 6:
+            continue
+        vagas.append({
+            "codigo": cels[0], "qtd": cels[1], "qtd_disponivel": cels[2],
+            "data_hora": cels[3], "jornada": cels[4], "unidade": cels[5],
+        })
+    return vagas
+
+
+def pesquisar_vagas(sessao):
+    """Pesquisa TODAS as vagas disponiveis (sem filtro)."""
     try:
-        log.info("Acessando página de pesquisa...")
-        resp = sessao.get(PESQUISA_URL)
-        resp.raise_for_status()
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        # Procura por tabela de vagas
-        tabela = soup.find("table")
-        if not tabela:
-            log.warning("Nenhuma tabela de vagas encontrada")
+        log.info("Acessando pesquisa...")
+        r = sessao.get(PESQUISA_URL, timeout=20)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        form = _form_pesquisa(soup)
+        if form is None:
+            log.warning("Form de pesquisa nao encontrado")
             return []
-
-        vagas = []
-        linhas = tabela.find_all("tr")[1:]  # Pula cabeçalho
-
-        for linha in linhas:
-            cels = linha.find_all("td")
-            if len(cels) < 3:
-                continue
-
-            # Extrair dados da vaga
-            data = cels[0].get_text(strip=True)
-            horario = cels[1].get_text(strip=True)
-            atividade = cels[2].get_text(strip=True)
-            status = cels[3].get_text(strip=True) if len(cels) > 3 else "Disponível"
-
-            # Procura por botão de ação
-            link = linha.find("a")
-            botao = linha.find("button")
-
-            vaga = {
-                "data": data,
-                "horario": horario,
-                "atividade": atividade,
-                "status": status,
-                "disponivel": "vago" in status.lower() or "disponível" in status.lower()
-            }
-
-            if link:
-                vaga["link"] = link.get("href", "")
-                vaga["id"] = re.search(r"id=(\w+)", vaga["link"]).group(1) if re.search(r"id=(\w+)", vaga["link"]) else ""
-
-            vagas.append(vaga)
-
-        log.info(f"✓ Encontradas {len(vagas)} vagas")
+        dados = _serializar_form(form)
+        # sem filtro: unidade/jornada = "" (Todas)
+        for nome in (_select_por_opcao(form, "Todas as Unidades"),
+                     _select_por_opcao(form, "Todas as Jornadas")):
+            if nome:
+                dados[nome] = ""
+        botao = _nome_botao(form)
+        if botao:
+            dados[botao] = dados.get(botao, "")
+        r2 = sessao.post(PESQUISA_URL, data=dados, timeout=20)
+        vagas = parse_vagas(r2.text)
+        log.info(f"Encontradas {len(vagas)} vaga(s)")
         return vagas
-
     except Exception as e:
         log.error(f"Erro na pesquisa: {e}")
         return []
 
-# ─────────────────────────────────────────────────────────────────────────────
-# INSCRIÇÃO EM VAGAS
-# ─────────────────────────────────────────────────────────────────────────────
 
-def inscrever_vaga(sessao: requests.Session, vaga_id: str) -> bool:
-    """Tenta inscrever em uma vaga específica"""
+# ---------------------------------------------------------------------------
+# Inscricao (best-effort; exige re-autenticacao usuario+senha)
+# ---------------------------------------------------------------------------
+
+def inscrever_vaga(sessao, codigo):
+    """
+    Tenta inscrever na vaga pelo codigo, na pagina inscricao.xhtml.
+    OBS: o fluxo real e selecionar a linha + re-autenticar. Como o diálogo de
+    re-auth so existe quando ha vaga, este passo nao foi validado ao vivo.
+    So reporta SUCESSO com marcador explicito.
+    """
     try:
-        resp = sessao.get(f"{INSCRICAO_URL}?id={vaga_id}")
-        resp.raise_for_status()
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        # Procura pelo ViewState
-        viewstate_input = soup.find("input", {"id": re.compile(r"ViewState")})
-        if not viewstate_input:
-            viewstate_input = soup.find("input", {"name": "javax.faces.ViewState"})
-
-        if not viewstate_input:
-            log.warning(f"ViewState não encontrado para vaga {vaga_id}")
-            return False
-
-        viewstate = viewstate_input["value"]
-        viewstate_name = viewstate_input.get("id", "javax.faces.ViewState")
-
-        # Procura por campos do formulário
-        form = soup.find("form")
+        r = sessao.get(INSCRICAO_URL, timeout=20)
+        soup = BeautifulSoup(r.text, "html.parser")
+        form = _form_pesquisa(soup) or soup.find("form")
         if not form:
-            log.warning(f"Formulário não encontrado para vaga {vaga_id}")
             return False
-
-        # Encontra botão de confirmação
-        button = form.find("button") or form.find("input", {"type": "submit"})
-        if not button:
-            log.warning(f"Botão de confirmação não encontrado para vaga {vaga_id}")
-            return False
-
-        button_name = button.get("name", "")
-
-        # Monta dados da requisição
-        data = {
-            viewstate_name: viewstate,
-        }
-
-        if button_name:
-            data[button_name] = button.get("value", "")
-
-        # Faz requisição AJAX
-        resp = sessao.post(INSCRICAO_URL, data=data, headers=AJAX_HEADERS)
-        resp.raise_for_status()
-
-        if "sucesso" in resp.text.lower() or "inscrit" in resp.text.lower():
-            log.info(f"✓ Inscrição realizada na vaga {vaga_id}")
+        dados = _serializar_form(form)
+        # informa o codigo da vaga no campo de codigo, se existir
+        for inp in form.find_all("input"):
+            _id = (inp.get("id") or "").lower()
+            if "codigo" in _id or "j_idt49" in _id:
+                dados[inp.get("name")] = codigo
+        # re-autenticacao: preenche eventuais campos usuario/senha presentes
+        for inp in form.find_all("input"):
+            tipo = (inp.get("type") or "").lower()
+            if tipo == "password" and inp.get("name"):
+                dados[inp.get("name")] = SENHA
+        vs = _viewstate(soup)
+        if vs:
+            dados["javax.faces.ViewState"] = vs
+        r2 = sessao.post(INSCRICAO_URL, data=dados, timeout=20)
+        t = r2.text.lower()
+        if any(m in t for m in ("inscricao realizada", "inscrito com sucesso", "sucesso")):
             return True
-        else:
-            log.warning(f"Resposta ambígua na inscrição da vaga {vaga_id}")
-            return False
-
+        return False
     except Exception as e:
-        log.error(f"Erro ao inscrever em vaga {vaga_id}: {e}")
+        log.error(f"Erro ao inscrever {codigo}: {e}")
         return False
 
-def inscrever_continuo(sessao: requests.Session, vagas: list, duracao_segundos: int = 50):
-    """
-    Tenta inscrever em todas as vagas repetidamente por N segundos.
-    Inicia 10 segundos antes das 20:00 (19:59:50).
-    """
+
+def inscrever_em_todas(sessao, vagas, duracao_segundos=50):
     if not vagas:
-        log.warning("Nenhuma vaga disponível para inscrição")
+        log.warning("Nenhuma vaga para inscrever")
+        return
+    log.info(f"Inscricao continua em {len(vagas)} vaga(s) por {duracao_segundos}s")
+    inicio = time.time()
+    inscritas = set()
+    tentativa = 0
+    while (time.time() - inicio) < duracao_segundos:
+        tentativa += 1
+        for v in vagas:
+            cod = v.get("codigo")
+            if not cod or cod in inscritas:
+                continue
+            if inscrever_vaga(sessao, cod):
+                inscritas.add(cod)
+                log.info(f"Inscrito: vaga {cod}")
+                enviar_telegram(f"Inscrito: vaga {cod} - {v.get('data_hora','')} "
+                                f"{v.get('unidade','')}")
+            time.sleep(0.3)
+        time.sleep(0.5)
+    log.info(f"Fim. Total inscrito: {len(inscritas)}/{len(vagas)}")
+    if inscritas:
+        enviar_telegram(f"Inscricao finalizada: {len(inscritas)} vaga(s).")
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+def main():
+    log.info(f"BOT-GERAL iniciando | MODO={MODO}")
+    if not MATRICULA or not SENHA:
+        log.error("SISVEP_MATRICULA/SISVEP_SENHA nao configurados")
+        sys.exit(1)
+
+    sessao = criar_sessao()
+    if not fazer_login(sessao):
+        enviar_telegram("BOT-GERAL: falha no login.")
+        sys.exit(1)
+
+    vagas = pesquisar_vagas(sessao)
+
+    if not vagas:
+        enviar_telegram("BOT-GERAL: nenhuma vaga disponivel no momento.")
+        log.info("Sem vagas.")
         return
 
-    log.info(f"Iniciando inscrição contínua em {len(vagas)} vaga(s) por {duracao_segundos} segundos")
+    resumo = "\n".join(f"- {v['codigo']} | {v['data_hora']} | {v['unidade']} | "
+                       f"{v['jornada']} | {v['qtd_disponivel']} disp."
+                       for v in vagas)
+    enviar_telegram(f"BOT-GERAL: {len(vagas)} vaga(s) encontrada(s):\n{resumo}")
 
-    tempo_inicio = time.time()
-    tentativa = 1
-    inscritas = set()
+    if MODO == "inscricao":
+        inscrever_em_todas(sessao, vagas)
+    else:
+        log.info("Modo pesquisa - apenas listagem (sem inscrever)")
 
-    while (time.time() - tempo_inicio) < duracao_segundos:
-        for vaga in vagas:
-            vaga_id = vaga.get("id", "")
-            if not vaga_id or vaga_id in inscritas:
-                continue
 
-            log.info(f"[Tentativa {tentativa}] Inscrevendo em: {vaga['atividade']} ({vaga['data']} {vaga['horario']})")
+# ---------------------------------------------------------------------------
+# Autoteste do parser (SELFTEST=1, sem rede)
+# ---------------------------------------------------------------------------
 
-            if inscrever_vaga(sessao, vaga_id):
-                inscritas.add(vaga_id)
-                enviar_telegram(f"✓ Inscrito com sucesso em:\n{vaga['atividade']}\n{vaga['data']} {vaga['horario']}")
-
-            time.sleep(0.5)  # Pequeno delay entre vagas
-
-        tentativa += 1
-        tempo_decorrido = int(time.time() - tempo_inicio)
-        tempo_restante = duracao_segundos - tempo_decorrido
-
-        if tempo_restante > 0:
-            log.info(f"Aguardando {tempo_restante}s antes da próxima rodada...")
-            time.sleep(min(5, tempo_restante))
-
-    log.info(f"Inscrição contínua finalizada. Total inscrito: {len(inscritas)}")
+if __name__ == "__main__" and os.environ.get("SELFTEST"):
+    vazio = '<table id="frmPrincipal:tabelaVagasDisponiveis"><tbody>' \
+            '<tr><td colspan="7">Nao ha Vagas Disponiveis.</td></tr></tbody></table>'
+    com = '<table id="frmPrincipal:tabelaVagasDisponiveis"><tbody>' \
+          '<tr><td>1024</td><td>3</td><td>2</td><td>15/06/2026 08:00</td>' \
+          '<td>8 h</td><td>CDP</td><td><button>Selecionar</button></td></tr></tbody></table>'
+    assert parse_vagas(vazio) == []
+    vs = parse_vagas(com)
+    assert len(vs) == 1 and vs[0]["codigo"] == "1024" and vs[0]["unidade"] == "CDP", vs
+    print("OK - parser bot-geral funcionando:", vs[0])
+elif __name__ == "__main__":
+    main()
