@@ -1,0 +1,37 @@
+COPIE EXATAMENTE ISTO E COLE NO POWERSHELL:
+
+
+cd C:\Users\Roberto\bot-geral; git push origin main
+
+
+DEPOIS PRESSIONE ENTER E AGUARDE
+
+
+═══════════════════════════════════════════════════════════════════
+
+PASSO A PASSO:
+
+1. Abra PowerShell (ou Terminal)
+
+2. COPIE ISTO:
+   cd C:\Users\Roberto\bot-geral; git push origin main
+
+3. COLE no PowerShell
+
+4. Pressione ENTER
+
+5. Se pedir username: Digite seu usuário do GitHub
+
+6. Se pedir senha: Cole seu Personal Access Token (PAT)
+   ou deixe GitHub fazer autenticação automática
+
+7. Aguarde a mensagem de sucesso
+
+═══════════════════════════════════════════════════════════════════
+
+SE VER "Everything up-to-date" OU SUCESSO:
+✅ PRONTO! Arquivo foi para GitHub
+
+DEPOIS VÁ PARA:
+https://github.com/koryyn/bot-geral/actions
+Clique "Run workflow" → modo "pesquisa"
