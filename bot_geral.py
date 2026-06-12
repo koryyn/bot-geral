@@ -119,6 +119,7 @@ def fazer_login(sessao: requests.Session) -> bool:
         log.info(f"Fazendo login com matrícula: {MATRICULA}")
 
         data = {
+            "frm": "frm",
             "username": MATRICULA,
             "password": SENHA,
             viewstate_name: viewstate,
