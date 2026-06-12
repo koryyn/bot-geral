@@ -74,12 +74,6 @@ def criar_sessao() -> requests.Session:
     s.headers.update(HEADERS)
     return s
 
-def get_viewstate(soup: BeautifulSoup) -> str:
-    el = soup.find("input", {"name": "javax.faces.ViewState"})
-    if not el:
-        raise RuntimeError("ViewState não encontrado")
-    return el["value"]
-
 def enviar_telegram(mensagem: str):
     """Envia mensagem ao Telegram (opcional)"""
     if not TG_TOKEN or not TG_CHAT_ID:
@@ -102,36 +96,39 @@ def fazer_login(sessao: requests.Session) -> bool:
         resp.raise_for_status()
 
         soup = BeautifulSoup(resp.text, "html.parser")
-        viewstate = get_viewstate(soup)
+        viewstate_input = soup.find("input", {"id": re.compile(r"ViewState")})
 
-        # Descobrir nomes dos campos dinamicamente
+        if not viewstate_input:
+            viewstate_input = soup.find("input", {"name": "javax.faces.ViewState"})
+
+        if not viewstate_input:
+            raise RuntimeError("ViewState não encontrado")
+
+        viewstate = viewstate_input["value"]
+        viewstate_name = viewstate_input.get("id", "javax.faces.ViewState")
+
+        # Procurar pelos campos de username e password
         form = soup.find("form")
-        inputs = form.find_all("input", {"type": "text"})
-        password_input = form.find("input", {"type": "password"})
-        button = form.find("button") or form.find("input", {"type": "submit"})
+        username_input = form.find("input", {"name": "username"})
+        password_input = form.find("input", {"name": "password"})
+        button = form.find("button", {"name": "btnEmitir"})
 
-        if not inputs or not password_input or not button:
+        if not username_input or not password_input or not button:
             raise RuntimeError("Não foi possível encontrar campos do formulário")
-
-        username_name = inputs[0]["name"]
-        password_name = password_input["name"]
-        button_name = button.get("name", "")
 
         log.info(f"Fazendo login com matrícula: {MATRICULA}")
 
         data = {
-            username_name: MATRICULA,
-            password_name: SENHA,
-            "javax.faces.ViewState": viewstate,
+            "username": MATRICULA,
+            "password": SENHA,
+            viewstate_name: viewstate,
+            "btnEmitir": "Entrar"
         }
-
-        if button_name:
-            data[button_name] = button.get("value", "")
 
         resp = sessao.post(LOGIN_URL, data=data)
         resp.raise_for_status()
 
-        if "login" in resp.url.lower() or "erro" in resp.text.lower():
+        if "login" in resp.url.lower() or ("erro" in resp.text.lower() and "login" in resp.text.lower()):
             log.error("Falha no login")
             return False
 
@@ -214,7 +211,18 @@ def inscrever_vaga(sessao: requests.Session, vaga_id: str) -> bool:
         resp.raise_for_status()
 
         soup = BeautifulSoup(resp.text, "html.parser")
-        viewstate = get_viewstate(soup)
+
+        # Procura pelo ViewState
+        viewstate_input = soup.find("input", {"id": re.compile(r"ViewState")})
+        if not viewstate_input:
+            viewstate_input = soup.find("input", {"name": "javax.faces.ViewState"})
+
+        if not viewstate_input:
+            log.warning(f"ViewState não encontrado para vaga {vaga_id}")
+            return False
+
+        viewstate = viewstate_input["value"]
+        viewstate_name = viewstate_input.get("id", "javax.faces.ViewState")
 
         # Procura por campos do formulário
         form = soup.find("form")
@@ -232,7 +240,7 @@ def inscrever_vaga(sessao: requests.Session, vaga_id: str) -> bool:
 
         # Monta dados da requisição
         data = {
-            "javax.faces.ViewState": viewstate,
+            viewstate_name: viewstate,
         }
 
         if button_name:
