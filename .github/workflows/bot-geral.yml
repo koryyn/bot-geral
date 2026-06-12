@@ -1,0 +1,109 @@
+name: BOT-GERAL - Pesquisa e Inscrição Automática
+
+on:
+  schedule:
+    # 19:58 BRT (UTC-3) = 22:58 UTC — Pesquisa de vagas
+    - cron: "58 22 * * *"
+
+    # 19:59:50 BRT = 22:59:50 UTC — Inscrição contínua (50 segundos até 20:00:40)
+    # Arredondado para 23:00 UTC (primeira execução acontece ~0:01 local)
+    - cron: "0 23 * * *"
+
+  workflow_dispatch:
+    inputs:
+      modo:
+        description: "Modo de execução"
+        required: true
+        default: "pesquisa"
+        type: choice
+        options: [pesquisa, inscricao]
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # ┌─────────────────────────────────────────────────────────────────────────┐
+  # │ JOB 1 · Pesquisa de Vagas (19:58)                                       │
+  # └─────────────────────────────────────────────────────────────────────────┘
+  pesquisa:
+    name: "🔍 Pesquisa de Voluntários (19:58)"
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'schedule' && github.event.schedule == '58 22 * * *') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.modo == 'pesquisa')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Instalar dependências
+        run: pip install requests beautifulsoup4 lxml
+
+      - name: 🔍 Pesquisar voluntários vagos
+        env:
+          SISVEP_MATRICULA: ${{ secrets.SISVEP_MATRICULA }}
+          SISVEP_SENHA: ${{ secrets.SISVEP_SENHA }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          MODO: pesquisa
+        run: python bot_geral.py
+
+  # ┌─────────────────────────────────────────────────────────────────────────┐
+  # │ JOB 2 · Inscrição Contínua (19:59:50 - 20:00:40)                        │
+  # └─────────────────────────────────────────────────────────────────────────┘
+  inscricao:
+    name: "📝 Inscrição Automática (19:59:50-20:00:40)"
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'schedule' && github.event.schedule == '0 23 * * *') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.modo == 'inscricao')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Instalar dependências
+        run: pip install requests beautifulsoup4 lxml
+
+      - name: ⏰ Aguardar janela de inscrição (19:59:50)
+        run: |
+          # Calcula tempo até 19:59:50 BRT
+          # Este script aguarda até o horário exato
+          python3 << 'EOF'
+          import time
+          from datetime import datetime
+          import pytz
+
+          brt = pytz.timezone('America/Sao_Paulo')
+
+          while True:
+              now = datetime.now(brt)
+              target = now.replace(hour=19, minute=59, second=50, microsecond=0)
+
+              if now >= target:
+                  break
+
+              wait_seconds = (target - now).total_seconds()
+              if wait_seconds > 0:
+                  print(f"Aguardando {wait_seconds:.0f}s até 19:59:50...")
+                  time.sleep(min(10, wait_seconds))
+
+          print(f"✓ Iniciando inscrição às {datetime.now(brt).strftime('%H:%M:%S')} BRT")
+          EOF
+
+      - name: 📝 Inscrever em todas as vagas (50 segundos)
+        env:
+          SISVEP_MATRICULA: ${{ secrets.SISVEP_MATRICULA }}
+          SISVEP_SENHA: ${{ secrets.SISVEP_SENHA }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          MODO: inscricao
+        run: python bot_geral.py
+        timeout-minutes: 2
+        continue-on-error: true
