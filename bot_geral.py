@@ -88,50 +88,101 @@ def enviar_telegram(mensagem: str):
 # LOGIN
 # ─────────────────────────────────────────────────────────────────────────────
 
+def get_viewstate(soup: BeautifulSoup) -> str:
+    """Extrai o ViewState da página"""
+    el = soup.find("input", {"name": "javax.faces.ViewState"})
+    if not el:
+        raise RuntimeError("ViewState não encontrado na página")
+    return el["value"]
+
+
 def fazer_login(sessao: requests.Session) -> bool:
-    """Faz login no sistema"""
+    """
+    Faz login descobrindo os campos do formulário dinamicamente,
+    sem depender de IDs que podem mudar entre versões do JSF.
+    """
     try:
         log.info("Acessando página de login...")
-        resp = sessao.get(LOGIN_URL)
-        resp.raise_for_status()
+        r = sessao.get(LOGIN_URL, timeout=20)
+        r.raise_for_status()
 
-        soup = BeautifulSoup(resp.text, "html.parser")
-        viewstate_input = soup.find("input", {"id": re.compile(r"ViewState")})
+        soup = BeautifulSoup(r.text, "html.parser")
+        vs = get_viewstate(soup)
 
-        if not viewstate_input:
-            viewstate_input = soup.find("input", {"name": "javax.faces.ViewState"})
-
-        if not viewstate_input:
-            raise RuntimeError("ViewState não encontrado")
-
-        viewstate = viewstate_input["value"]
-        viewstate_name = viewstate_input.get("id", "javax.faces.ViewState")
-
-        # Procurar pelos campos de username e password
+        # Descobre o formulário de login
         form = soup.find("form")
-        username_input = form.find("input", {"name": "username"})
-        password_input = form.find("input", {"name": "password"})
-        button = form.find("button", {"name": "btnEmitir"})
+        if not form:
+            log.error("Formulário de login não encontrado")
+            return False
 
-        if not username_input or not password_input or not button:
-            raise RuntimeError("Não foi possível encontrar campos do formulário")
+        form_id = form.get("id", "")
+        action = form.get("action", LOGIN_URL)
+        if not action.startswith("http"):
+            action = BASE_URL + action
+
+        # Monta o payload base com todos os campos hidden
+        payload = {}
+        for inp in form.find_all("input"):
+            name = inp.get("name", "")
+            value = inp.get("value", "")
+            tipo = inp.get("type", "text").lower()
+            if name and tipo not in ("submit", "button", "image"):
+                payload[name] = value
+
+        # Sobrescreve ViewState
+        payload["javax.faces.ViewState"] = vs
+
+        # Preenche matrícula e senha detectando os campos pelo tipo e nome
+        campos_texto = [
+            i for i in form.find_all("input")
+            if i.get("type", "text").lower() in ("text", "email", "") and i.get("name")
+        ]
+        campos_senha = [
+            i for i in form.find_all("input")
+            if i.get("type", "").lower() == "password" and i.get("name")
+        ]
+
+        if campos_texto:
+            payload[campos_texto[0]["name"]] = MATRICULA
+            log.info(f"Campo matrícula: {campos_texto[0]['name']}")
+        else:
+            # Fallback para nomes comuns
+            for nome in ("username", "j_username", "cpf", "matricula"):
+                if nome in payload:
+                    payload[nome] = MATRICULA
+                    break
+
+        if campos_senha:
+            payload[campos_senha[0]["name"]] = SENHA
+            log.info(f"Campo senha: {campos_senha[0]['name']}")
+        else:
+            for nome in ("password", "j_password", "senha"):
+                if nome in payload:
+                    payload[nome] = SENHA
+                    break
+
+        # Adiciona o botão de submit se encontrado
+        btn = form.find("button", {"type": "submit"}) or form.find("input", {"type": "submit"})
+        if btn and btn.get("name"):
+            payload[btn["name"]] = btn.get("value", "Entrar")
+
+        # Se formulário tem id, inclui no payload (padrão JSF)
+        if form_id:
+            payload[form_id] = form_id
 
         log.info(f"Fazendo login com matrícula: {MATRICULA}")
+        r2 = sessao.post(action, data=payload, timeout=20, allow_redirects=True)
 
-        data = {
-            "frm": "frm",
-            "username": MATRICULA,
-            "password": SENHA,
-            viewstate_name: viewstate,
-            "btnEmitir": "Entrar"
-        }
-
-        resp = sessao.post(LOGIN_URL, data=data)
-        resp.raise_for_status()
-
-        if "login" in resp.url.lower() or ("erro" in resp.text.lower() and "login" in resp.text.lower()):
-            log.error("Falha no login")
-            return False
+        # Verifica falha de login
+        if "login" in r2.url.lower():
+            soup2 = BeautifulSoup(r2.text, "html.parser")
+            erro = soup2.find(string=re.compile(r"inválid|incorret|erro|invalid", re.I))
+            if erro:
+                log.error(f"Falha no login: {erro.strip()}")
+                return False
+            if "login" in r2.url.lower() and "paginas" not in r2.url.lower():
+                log.warning("Redirecionou para login — credenciais podem estar erradas")
+                return False
 
         log.info("✓ Login realizado com sucesso")
         return True
@@ -300,52 +351,3 @@ def inscrever_continuo(sessao: requests.Session, vagas: list, duracao_segundos: 
             time.sleep(min(5, tempo_restante))
 
     log.info(f"Inscrição contínua finalizada. Total inscrito: {len(inscritas)}")
-    return len(inscritas)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
-
-def main():
-    log.info(f"BOT-GERAL iniciado às {hora()} - Modo: {MODO}")
-
-    if not MATRICULA or not SENHA:
-        log.error("SISVEP_MATRICULA e SISVEP_SENHA não configurados")
-        sys.exit(1)
-
-    sessao = criar_sessao()
-
-    if not fazer_login(sessao):
-        log.error("Não foi possível fazer login")
-        enviar_telegram("❌ BOT-GERAL: Falha no login")
-        sys.exit(1)
-
-    if MODO == "pesquisa":
-        log.info("=== MODO PESQUISA ===")
-        vagas = pesquisar_vagas(sessao)
-
-        if vagas:
-            mensagem = f"🔍 BOT-GERAL - {len(vagas)} vaga(s) encontrada(s):\n\n"
-            for v in vagas[:5]:  # Primeiras 5
-                mensagem += f"• {v['atividade']}\n  {v['data']} {v['horario']}\n"
-            if len(vagas) > 5:
-                mensagem += f"\n... e mais {len(vagas) - 5}"
-            enviar_telegram(mensagem)
-        else:
-            enviar_telegram("⚠️ BOT-GERAL: Nenhuma vaga encontrada")
-
-    elif MODO == "inscricao":
-        log.info("=== MODO INSCRIÇÃO ===")
-        vagas = pesquisar_vagas(sessao)
-
-        if vagas:
-            total_inscrito = inscrever_continuo(sessao, vagas, duracao_segundos=50)
-            enviar_telegram(f"📝 BOT-GERAL: Inscrição contínua finalizada. Total: {total_inscrito}")
-        else:
-            log.warning("Nenhuma vaga encontrada para inscrição")
-            enviar_telegram("⚠️ BOT-GERAL: Nenhuma vaga para inscrição")
-
-    log.info("BOT-GERAL finalizado")
-
-if __name__ == "__main__":
-    main()
