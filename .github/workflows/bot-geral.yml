@@ -5,9 +5,8 @@ on:
     # 19:58 BRT (UTC-3) = 22:58 UTC — Pesquisa de vagas
     - cron: "58 22 * * *"
 
-    # 19:59:50 BRT = 22:59:50 UTC — Inscrição contínua (50 segundos até 20:00:40)
-    # Arredondado para 23:00 UTC (primeira execução acontece ~0:01 local)
-    - cron: "0 23 * * *"
+    # 19:59 BRT = 22:59 UTC — Inscrição (aguarda até 19:59:50 e inscreve)
+    - cron: "59 22 * * *"
 
   workflow_dispatch:
     inputs:
@@ -58,7 +57,7 @@ jobs:
     name: "📝 Inscrição Automática (19:59:50-20:00:40)"
     runs-on: ubuntu-latest
     if: |
-      (github.event_name == 'schedule' && github.event.schedule == '0 23 * * *') ||
+      (github.event_name == 'schedule' && github.event.schedule == '59 22 * * *') ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.modo == 'inscricao')
 
     steps:
@@ -78,9 +77,9 @@ jobs:
           python3 << 'EOF'
           import time
           from datetime import datetime
-          import pytz
+          from zoneinfo import ZoneInfo
 
-          brt = pytz.timezone('America/Sao_Paulo')
+          brt = ZoneInfo('America/Sao_Paulo')
 
           while True:
               now = datetime.now(brt)
